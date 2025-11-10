@@ -12,55 +12,19 @@ try:
     import readline
 except ImportError:
     readline = None
-from fnmatch import fnmatch
 
-# ================================= 新版：路径式操作 =================================
+
 class Pan123:
     def __init__(
-        self,
-        readfile=True,
-        user_name="",
-        pass_word="",
-        authorization="",
-        input_pwd=True,
+            self,
+            readfile=True,
+            user_name="",
+            pass_word="",
+            authorization="",
+            input_pwd=True,
     ):
         self.recycle_list = None
-        self.list = []  # 当前目录列表
-        self.dir_cache = {}  # file_id -> list[children]
-        self.path_cache = {}  # 绝对路径 -> fileInfo
-        self.current_dir_id = 0
-        self.path_stack = ["/"]  # 显示路径
-        self.last_api_error_code = 0  # 最近一次目录请求错误码
-
-        self.header_only_usage = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/"
-            "537.36 (KHTML, like Gecko) Chrome/109.0.0.0 "
-            "Safari/537.36 Edg/109.0.1474.0",
-            "app-version": "2",
-            "platform": "web",
-        }
-        self.header_logined = {
-            "Accept": "*/*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-            "App-Version": "3",
-            "Authorization": "", # 初始化时为空
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "LoginUuid": "z-uk_yT8HwR4raGX1gqGk",
-            "Pragma": "no-cache",
-            "Referer": "https://www.123pan.com/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/"
-            "537.36 (KHTML, like Gecko) Chrome/119.0.0.0 "
-            "Safari/537.36 Edg/119.0.0.0",
-            "platform": "web",
-            "sec-ch-ua": "^\\^Microsoft",
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "^\\^Windows^^",
-        }
-
+        self.list = None
         if readfile:
             self.read_ini(user_name, pass_word, input_pwd, authorization)
         else:
@@ -74,26 +38,180 @@ class Pan123:
             self.user_name = user_name
             self.password = pass_word
             self.authorization = authorization
-            self.header_logined["Authorization"] = self.authorization
+        self.header_only_usage = {
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/"
+                          "537.36 (KHTML, like Gecko) Chrome/109.0.0.0 "
+                          "Safari/537.36 Edg/109.0.1474.0",
+            "app-version": "2",
+            "platform": "web",
+        }
+        self.header_logined = {
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "App-Version": "3",
+            "Authorization": self.authorization,
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "LoginUuid": "z-uk_yT8HwR4raGX1gqGk",
+            "Pragma": "no-cache",
+            "Referer": "https://www.123pan.com/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/"
+                          "537.36 (KHTML, like Gecko) Chrome/119.0.0.0 "
+                          "Safari/537.36 Edg/119.0.0.0",
+            "platform": "web",
+            "sec-ch-ua": "^\\^Microsoft",
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": "^\\^Windows^^",
+        }
+        self.parent_file_id = 0  # 路径，文件夹的id,0为根目录
+        self.parent_file_list = [0]
+        res_code_getdir = self.get_dir()
+        if res_code_getdir != 0:
+            self.login()
+            self.get_dir()
 
-        # 初始化目录与自动登录
-        init_code = self.get_dir(self.current_dir_id)
-        if init_code != 0 or not self.list:
-            print("初始化列表失败或为空，尝试登录...")
-            if self.login() == 0:
-                self.get_dir(self.current_dir_id)
-
-        self.download_dir = os.path.abspath('.')
         self.max_workers = 3
-        self.lock_print = threading.Lock()
-        self.base_commands = [
-            'ls','cd','pwd','download','link','upload','share','delete','mkdir',
-            'reload','log','help','exit','setdir','re'
-        ]
+        self.lock = threading.Lock()
+        self.commands = ['ls','re','download','link','delete','cd','mkdir','upload','share','log','reload','exit','help']
         if readline:
             self._setup_completion()
 
-    # ------------------ API 基础 ------------------
+    # ------------------ 多选解析与批量操作 ------------------
+    def _parse_multi_expr(self, expr: str):
+        """解析形如 1,2,5-9  以及空格混合的表达式; 返回去重后的 0 基索引列表"""
+        parts = re.split(r'[\s,]+', expr.strip())
+        idx_set = set()
+        for p in parts:
+            if not p:
+                continue
+            if '-' in p:
+                a,b = p.split('-',1)
+                if a.isdigit() and b.isdigit():
+                    start = int(a); end = int(b)
+                    if start > end: start,end = end,start
+                    for v in range(start,end+1):
+                        idx = v-1
+                        if 0 <= idx < len(self.list):
+                            idx_set.add(idx)
+                        else:
+                            print(f"跳过越界编号: {v}")
+                else:
+                    print(f"非法区段: {p}")
+            else:
+                if p.isdigit():
+                    v = int(p)
+                    idx = v-1
+                    if 0 <= idx < len(self.list):
+                        idx_set.add(idx)
+                    else:
+                        print(f"跳过越界编号: {v}")
+                else:
+                    print(f"非法编号: {p}")
+        res = sorted(idx_set)
+        if not res:
+            print('未解析出有效编号')
+        return res
+
+    def download_batch(self, expr_list):
+        """支持多个表达式列表批量并行下载"""
+        all_idx = set()
+        for expr in expr_list:
+            all_idx.update(self._parse_multi_expr(expr))
+        indices = sorted(all_idx)
+        if not indices:
+            return
+        print(f"计划下载文件数量: {len(indices)} (并行: {self.max_workers})")
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            futures = [pool.submit(self.download, i) for i in indices]
+            for _ in as_completed(futures):
+                pass
+        print('批量下载完成')
+
+    def up_load_batch(self, paths):
+        """批量上传(顺序执行), 支持通配符"""
+        import glob
+        files = []
+        for p in paths:
+            expanded = glob.glob(p)
+            if not expanded:
+                print('未匹配到文件:', p)
+            for fp in expanded:
+                if os.path.isdir(fp):
+                    print('跳过目录:', fp)
+                else:
+                    files.append(fp)
+        if not files:
+            print('没有可上传文件')
+            return
+        print('准备上传文件数:', len(files))
+        for fp in files:
+            print('上传:', fp)
+            self.up_load(fp)
+        print('批量上传完成')
+
+    # ------------------ 命令补全 ------------------
+    def _setup_completion(self):
+        def complete(text, state):
+            buffer = readline.get_line_buffer()
+            parts = buffer.strip().split()
+            # 首参数
+            if len(parts) == 0 or (len(parts)==1 and not buffer.endswith(' ')):
+                cands = [c for c in self.commands if c.startswith(text)]
+            else:
+                cmd = parts[0]
+                if cmd == 'download':
+                    # 提示数字编号与范围模板
+                    nums = [str(i+1) for i in range(len(self.list))]
+                    base = []
+                    for n in nums:
+                        if n.startswith(text): base.append(n)
+                    if '1-'.startswith(text): base.append('1-')
+                    cands = base
+                elif cmd in ('cd','link','delete','mkdir','share','log','re','reload','ls'):
+                    # 提示编号
+                    nums = [str(i+1) for i in range(len(self.list))]
+                    cands = [n for n in nums if n.startswith(text)]
+                elif cmd == 'upload':
+                    # 本地路径补全
+                    prefix = text or ''
+                    import glob
+                    cands = []
+                    pat = prefix+'*'
+                    for p in glob.glob(pat):
+                        if os.path.isdir(p):
+                            cands.append(p.rstrip('/') + '/')
+                        else:
+                            cands.append(p)
+                else:
+                    cands = []
+            try:
+                return cands[state]
+            except IndexError:
+                return None
+        readline.set_completer(complete)
+        readline.parse_and_bind('tab: complete')
+
+    # ------------------ 帮助 ------------------
+    def help(self):
+        print('\n命令说明:')
+        print(' ls                列出当前目录')
+        print(' re                刷新目录')
+        print(' <编号>            进入文件夹 / 查看并下载文件')
+        print(' download <表达式...>  多文件下载: 如 download 1-3 5 8,10-12')
+        print(' upload <文件...>  多文件/通配符上传: upload *.zip a.txt')
+        print(' link <编号>       获取下载直链')
+        print(' delete <编号>     删除文件/目录')
+        print(' cd <编号|..|/>    进入目录 / 返回 / 根')
+        print(' mkdir <名称>      创建目录')
+        print(' share             交互式分享')
+        print(' log               重新登录')
+        print(' reload            重新读取配置文件')
+        print(' help              显示帮助')
+        print(' exit              退出\n')
+
     def login(self):
         data = {"remember": True, "passport": self.user_name, "password": self.password}
         sign = getSign("/b/api/user/sign_in")
@@ -106,32 +224,60 @@ class Pan123:
         res_sign = login_res.json()
         res_code_login = res_sign["code"]
         if res_code_login != 200:
-            print("登录失败:", res_sign.get("message"))
+            print("code = 1 Error:" + str(res_code_login))
+            print(res_sign["message"])
             return res_code_login
         token = res_sign["data"]["token"]
         self.authorization = "Bearer " + token
-        self.header_logined["Authorization"] = self.authorization
+        header_logined = {
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "App-Version": "3",
+            "Authorization": self.authorization,
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "LoginUuid": "z-uk_yT8HwR4raGX1gqGk",
+            "Pragma": "no-cache",
+            "Referer": "https://www.123pan.com/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/"
+                          "537.36 (KHTML, like"
+                          " Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+            "platform": "web",
+            "sec-ch-ua": "^\\^Microsoft",
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": "^\\^Windows^^",
+        }
+        self.header_logined = header_logined
+        # ret['cookie'] = cookie
         self.save_file()
-        return 0
+        return res_code_login
 
     def save_file(self):
-        with open("123pan.txt", "w", encoding="utf_8") as f:
-            f.write(json.dumps({
+        with open("123pan.txt", "w",encoding="utf_8") as f:
+            save_list = {
                 "userName": self.user_name,
                 "passWord": self.password,
                 "authorization": self.authorization,
-            }))
-        print("账号已保存")
+            }
 
-    def api_list(self, parent_id: int):
-        if parent_id in self.dir_cache:
-            return self.dir_cache[parent_id]
+            f.write(json.dumps(save_list))
+        print("Save!")
+
+    def get_dir(self):
+        res_code_getdir = 0
         page = 1
-        items = []
-        l_now = 0
+        lists = []
+        lenth_now = 0
         total = -1
-        while l_now < total or total == -1:
+        while lenth_now < total or total == -1:
+            base_url = "https://www.123pan.com/b/api/file/list/new"
+
+            # print(self.headerLogined)
             sign = getSign("/b/api/file/list/new")
+            print(sign)
             params = {
                 sign[0]: sign[1],
                 "driveId": 0,
@@ -139,169 +285,87 @@ class Pan123:
                 "next": 0,
                 "orderBy": "file_id",
                 "orderDirection": "desc",
-                "parentFileId": str(parent_id),
+                "parentFileId": str(self.parent_file_id),
                 "trashed": False,
                 "SearchData": "",
                 "Page": str(page),
                 "OnlyLookAbnormalFile": 0,
             }
-            resp = requests.get("https://www.123pan.com/b/api/file/list/new", headers=self.header_logined, params=params, timeout=10)
-            data = resp.json()
-            code = data.get("code", -1)
-            self.last_api_error_code = code
-            if code != 0:
-                # 401 等错误直接中断
-                break
-            page_list = data["data"]["InfoList"]
-            items += page_list
-            total = data["data"]["Total"]
-            l_now += len(page_list)
+
+            a = requests.get(base_url, headers=self.header_logined, params=params, timeout=10)
+            # print(a.text)
+            # print(a.headers)
+            text = a.json()
+            res_code_getdir = text["code"]
+            if res_code_getdir != 0:
+                print(a.text)
+                print(a.headers)
+                print("code = 2 Error:" + str(res_code_getdir))
+                return res_code_getdir
+            lists_page = text["data"]["InfoList"]
+            lists += lists_page
+            total = text["data"]["Total"]
+            lenth_now += len(lists_page)
             page += 1
-        self.dir_cache[parent_id] = items
-        return items
+        file_num = 0
+        for i in lists:
+            i["FileNum"] = file_num
+            file_num += 1
 
-    def get_dir(self, parent_id: int):
-        items = self.api_list(parent_id)
-        if self.last_api_error_code != 0:
-            # token 失效或未登录，尝试自动登录后重试一次
-            if self.last_api_error_code in (401, 402, 403, 10002):
-                print("检测到未登录或 token 失效，自动登录中…")
-                if self.login() == 0:
-                    # 清除旧缓存重试
-                    self.dir_cache.pop(parent_id, None)
-                    items = self.api_list(parent_id)
+        self.list = lists
+        return res_code_getdir
+
+    def show(self):
+        print("--------------------")
+        for i in self.list:
+            file_size = i["Size"]
+            if file_size > 1048576:
+                download_size_print = str(round(file_size / 1048576, 2)) + "M"
             else:
-                print("获取目录失败 code=", self.last_api_error_code)
-        self.list = items
-        return self.last_api_error_code
+                download_size_print = str(round(file_size / 1024, 2)) + "K"
 
-    # ------------------ 路径解析 ------------------
-    def normalize(self, p: str):
-        if not p:
-            return '/'
-        if not p.startswith('/'):
-            # 相对路径
-            base = '/' if len(self.path_stack)==1 else '/'.join(self.path_stack).rstrip('/')
-            if base == '/':
-                p = '/' + p
-            else:
-                p = base + '/' + p
-        # 处理 .. 和 .
-        parts = []
-        for seg in p.split('/'):
-            if seg in ('', '.'):
-                continue
-            if seg == '..':
-                if parts:
-                    parts.pop()
-                continue
-            parts.append(seg)
-        return '/' + '/'.join(parts)
+            if i["Type"] == 0:
+                print(
+                    "\033[33m" + "编号:",
+                    self.list.index(i) + 1,
+                    "\033[0m \t\t" + download_size_print + "\t\t\033[36m",
+                    i["FileName"],
+                    "\033[0m",
+                )
+            elif i["Type"] == 1:
+                print(
+                    "\033[35m" + "编号:",
+                    self.list.index(i) + 1,
+                    " \t\t\033[36m",
+                    i["FileName"],
+                    "\033[0m",
+                )
 
-    def resolve(self, path: str):
-        path = self.normalize(path)
-        if path == '/':
-            return {'FileId': 0, 'FileName': '/', 'Type': 1}
-        # 分段逐层查询
-        segments = path.strip('/').split('/')
-        current_id = 0
-        node = None
-        built = []
-        for seg in segments:
-            children = self.api_list(current_id)
-            found = None
-            for ch in children:
-                if ch['FileName'] == seg:
-                    found = ch
-                    break
-            if not found:
-                return None
-            node = found
-            current_id = found['FileId']
-            built.append(seg)
-        # 缓存
-        self.path_cache[path] = node
-        return node
+        print("--------------------")
 
-    def re(self):
-        """刷新当前目录缓存"""
-        self.dir_cache.pop(self.current_dir_id, None)
-        self.path_cache.clear() # 路径缓存也应清理
-        print("当前目录缓存已刷新")
-        self.get_dir(self.current_dir_id)
-        self.ls()
-
-    # ------------------ 显示与导航 ------------------
-    def ls(self, path: str = ''):
-        target_path = path if path else self.pwd()
-        node = self.resolve(target_path)
-        if node is None or node['Type'] != 1:
-            print('路径不存在或不是目录')
-            return
-        file_id = node['FileId']
-        items = self.api_list(file_id)
-        if not items and self.last_api_error_code != 0:
-             print(f"获取目录失败: code={self.last_api_error_code}")
-             return
-        print(f"\n目录: {self.normalize(target_path)}  共 {len(items)} 项")
-        for ch in items:
-            size = ch['Size']
-            if ch['Type'] == 1:
-                mark = 'd'
-                size_str = '-'  # 目录无大小
-                color = '\033[35m'
-            else:
-                mark = 'f'
-                if size > 1048576:
-                    size_str = f"{round(size/1048576,2)}M"
-                else:
-                    size_str = f"{round(size/1024,2)}K"
-                color = '\033[33m'
-            print(f"{color}{mark}  {ch['FileName']:<40} {size_str:>8}\033[0m")
-        print("")
-
-    def cd(self, path: str):
-        node = self.resolve(path)
-        if not node:
-            print('路径不存在')
-            return
-        if node['Type'] != 1:
-            print('不是目录')
-            return
-        self.current_dir_id = node['FileId']
-        norm = self.normalize(path)
-        self.path_stack = ['/' ] + norm.strip('/').split('/') if norm != '/' else ['/']
-        self.get_dir(self.current_dir_id)
-        print('进入', norm)
-
-    def pwd(self):
-        if len(self.path_stack) == 1:
-            return '/'
-        return '/' + '/'.join(self.path_stack[1:])
-
-    # ------------------ 下载 / 链接 ------------------
-    def link_path(self, path: str, showlink=True):
-        node = self.resolve(path)
-        if not node:
-            print('文件不存在')
-            return None
-        if node['Type'] == 1:
+    # fileNumber 从0开始，0为第一个文件，传入时需要减一 ！！！
+    def link(self, file_number, showlink=True):
+        file_detail = self.list[file_number]
+        type_detail = file_detail["Type"]
+        if type_detail == 1:
             down_request_url = "https://www.123pan.com/a/api/file/batch_download_info"
-            down_request_data = {"fileIdList": [{"fileId": int(node["FileId"])}]}
-            sign_key = "/a/api/file/download_info"  # 兼容接口
+            down_request_data = {"fileIdList": [{"fileId": int(file_detail["FileId"])}]}
+
         else:
             down_request_url = "https://www.123pan.com/a/api/file/download_info"
             down_request_data = {
                 "driveId": 0,
-                "etag": node["Etag"],
-                "fileId": node["FileId"],
-                "s3keyFlag": node["S3KeyFlag"],
-                "type": node["Type"],
-                "fileName": node["FileName"],
-                "size": node["Size"],
+                "etag": file_detail["Etag"],
+                "fileId": file_detail["FileId"],
+                "s3keyFlag": file_detail["S3KeyFlag"],
+                "type": file_detail["Type"],
+                "fileName": file_detail["FileName"],
+                "size": file_detail["Size"],
             }
-            sign_key = "/a/api/file/download_info"
-        sign = getSign(sign_key)
+        # print(down_request_data)
+
+        sign = getSign("/a/api/file/download_info")
+
         link_res = requests.post(
             down_request_url,
             headers=self.header_logined,
@@ -309,162 +373,461 @@ class Pan123:
             data=down_request_data,
             timeout=10
         )
-        res_code_download = link_res.json().get("code", -1)
+        # print(linkRes.text)
+        res_code_download = link_res.json()["code"]
         if res_code_download != 0:
-            print("获取下载信息失败:", link_res.text)
-            return None
+            print("code = 3 Error:" + str(res_code_download))
+            # print(linkRes.json())
+            return res_code_download
         download_link_base64 = link_res.json()["data"]["DownloadUrl"]
         base64_url = re.findall("params=(.*)&", download_link_base64)[0]
-        down_load_url = base64.b64decode(base64_url).decode("utf-8")
-        redirect_json = requests.get(down_load_url, timeout=10).json()
-        redirect_url = redirect_json["data"]["redirect_url"]
+        # print(Base64Url)
+        down_load_url = base64.b64decode(base64_url)
+        down_load_url = down_load_url.decode("utf-8")
+
+        next_to_get = requests.get(down_load_url,timeout=10).json()
+        redirect_url = next_to_get["data"]["redirect_url"]
         if showlink:
             print(redirect_url)
+
         return redirect_url
 
-    def download_path(self, path: str, local_dir: str = None):
-        node = self.resolve(path)
-        if not node:
-            print('文件不存在')
-            return
-        if node['Type'] == 1:
-            print('暂不支持目录直接下载(需打包逻辑)')
-            return
-        url = self.link_path(path, showlink=False)
-        if not url:
-            return
-        file_name = node['FileName']
-        
-        # 使用指定的 local_dir 或默认的 download_dir
-        download_to_dir = local_dir if local_dir is not None else self.download_dir
-        if not os.path.isdir(download_to_dir):
-            try:
-                os.makedirs(download_to_dir)
-                print(f"创建本地目录: {download_to_dir}")
-            except OSError as e:
-                print(f"创建本地目录失败: {e}")
+    def download(self, file_number):
+        file_detail = self.list[file_number]
+        down_load_url = self.link(file_number, showlink=False)
+        file_name = file_detail["FileName"]  # 文件名
+        if os.path.exists(file_name):
+            print("文件 " + file_name + " 已存在，是否要覆盖？")
+            sure_download = input("输入1覆盖，2取消：")
+            if sure_download != "1":
                 return
+        down = requests.get(down_load_url, stream=True, timeout=10)
 
-        target_path = os.path.join(download_to_dir, file_name)
-        if os.path.exists(target_path):
-            print('文件已存在，跳过:', target_path)
-            return
-        try:
-            down = requests.get(url, stream=True, timeout=10)
-        except Exception as e:
-            print('下载失败:', e)
-            return
-        size = int(down.headers.get('Content-Length', 0))
-        if size > 1048576:
-            size_str = f"{round(size/1048576,2)}M"
+        file_size = int(down.headers["Content-Length"])  # 文件大小
+        content_size = int(file_size)  # 文件总大小
+        data_count = 0  # 当前已传输的大小
+        if file_size > 1048576:
+            size_print_download = str(round(file_size / 1048576, 2)) + "M"
         else:
-            size_str = f"{round(max(size,1)/1024,2)}K"
-        print(f"开始下载: {file_name} 大小 {size_str}")
-        data_count = 0
-        t0 = time.time()
-        t_prev = t0
-        dc_prev = 0
-        with open(target_path, 'wb') as f:
-            for chunk in down.iter_content(64*1024):
-                if not chunk:
-                    break
-                f.write(chunk)
-                data_count += len(chunk)
-                if time.time() - t_prev >= 1:
-                    pass_data = data_count - dc_prev
-                    dc_prev = data_count
-                    speed = pass_data / (time.time() - t_prev + 1e-6)
-                    t_prev = time.time()
-                    speed_m = speed/1048576
-                    speed_str = f"{speed_m:.2f}M/s" if speed_m > 1 else f"{speed_m*1024:.2f}K/s"
-                    percent = data_count/size*100 if size else 0
-                    bar_len = 30
-                    done = int(percent/100*bar_len)
-                    bar = '█'*done + ' '*(bar_len-done)
-                    print(f"\r[{bar}] {percent:5.1f}% {speed_str} ", end='')
-        print("\n完成", file_name)
+            size_print_download = str(round(file_size / 1024, 2)) + "K"
+        print(file_name + "    " + size_print_download)
+        time1 = time.time()
+        time_temp = time1
+        data_count_temp = 0
+        with open(file_name, "wb") as f:
+            for i in down.iter_content(1024):
+                f.write(i)
+                done_block = int((data_count / content_size) * 50)
+                data_count = data_count + len(i)
+                # 实时进度条进度
+                now_jd = (data_count / content_size) * 100
+                # %% 表示%
+                # 测速
+                time1 = time.time()
+                pass_time = time1 - time_temp
+                if pass_time > 1:
+                    time_temp = time1
+                    pass_data = int(data_count) - int(data_count_temp)
+                    data_count_temp = data_count
+                    speed = pass_data / int(pass_time)
+                    speed_m = speed / 1048576
+                    if speed_m > 1:
+                        speed_print = str(round(speed_m, 2)) + "M/S"
+                    else:
+                        speed_print = str(round(speed_m * 1024, 2)) + "K/S"
+                    print(
+                        "\r [%s%s] %d%%  %s"
+                        % (
+                            done_block * "█",
+                            " " * (50 - 1 - done_block),
+                            now_jd,
+                            speed_print,
+                        ),
+                        end="",
+                    )
+                elif data_count == content_size:
+                    print("\r [%s%s] %d%%  %s" % (50 * "█", "", 100, ""), end="")
+            print("\nok")
 
-    def download_many_paths(self, paths: list, local_dir: str = None):
-        files = []
-        for p in paths:
-            node = self.resolve(p)
-            if node and node['Type']==0:
-                files.append(p)
+    def recycle(self):
+        recycle_id = 0
+        url = (
+                "https://www.123pan.com/a/api/file/list/new?driveId=0&limit=100&next=0"
+                "&orderBy=fileId&orderDirection=desc&parentFileId="
+                + str(recycle_id)
+                + "&trashed=true&&Page=1"
+        )
+        recycle_res = requests.get(url, headers=self.header_logined, timeout=10)
+        json_recycle = recycle_res.json()
+        recycle_list = json_recycle["data"]["InfoList"]
+        self.recycle_list = recycle_list
+
+    # fileNumber 从0开始，0为第一个文件，传入时需要减一 ！！！
+    def delete_file(self, file, by_num=True, operation=True):
+        # operation = 'true' 删除 ， operation = 'false' 恢复
+        if by_num:
+            print(file)
+            if not str(file).isdigit():
+                print("请输入数字")
+                return -1
+            if 0 <= file < len(self.list):
+                file_detail = self.list[file]
             else:
-                print('跳过(不存在或非文件):', p)
-        if not files:
-            print('没有有效文件')
-            return
-        print('批量下载文件数:', len(files))
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            futures = [pool.submit(self.download_path, fp, local_dir) for fp in files]
-            for _ in as_completed(futures):
-                pass
-        print('批量下载完成')
-
-    # ------------------ 目录收集（支持目录递归下载） ------------------
-    def collect_files(self, path: str):
-        """将路径扩展为文件列表; 若是文件直接返回列表; 若是目录递归收集内部所有文件"""
-        node = self.resolve(path)
-        if not node:
-            print('路径不存在:', path)
-            return []
-        norm = self.normalize(path)
-        if node['Type'] == 0:
-            return [norm]
-        # 目录递归
-        return self._collect_dir(node['FileId'], norm)
-
-    def _collect_dir(self, dir_id: int, base_path: str):
-        files = []
-        for ch in self.api_list(dir_id):
-            child_path = base_path.rstrip('/') + '/' + ch['FileName']
-            if ch['Type'] == 0:
-                files.append(child_path)
+                print("不在合理范围内")
+                return
+        else:
+            if file in self.list:
+                file_detail = file
             else:
-                files.extend(self._collect_dir(ch['FileId'], child_path))
-        return files
-
-    # ------------------ 其它操作 ------------------
-    def delete_path(self, path: str):
-        node = self.resolve(path)
-        if not node:
-            print('路径不存在')
-            return
+                print("文件不存在")
+                return
         data_delete = {
             "driveId": 0,
-            "fileTrashInfoList": node,
-            "operation": True,
+            "fileTrashInfoList": file_detail,
+            "operation": operation,
         }
-        resp = requests.post("https://www.123pan.com/a/api/file/trash", data=json.dumps(data_delete), headers=self.header_logined, timeout=10)
-        js = resp.json()
-        print(js.get('message'))
-        # 刷新当前目录缓存
-        self.dir_cache.pop(self.current_dir_id, None)
-        self.get_dir(self.current_dir_id)
+        delete_res = requests.post(
+            "https://www.123pan.com/a/api/file/trash",
+            data=json.dumps(data_delete),
+            headers=self.header_logined,
+            timeout=10
+        )
+        dele_json = delete_res.json()
+        print(dele_json)
+        message = dele_json["message"]
+        print(message)
 
-    def mkdir(self, dirname: str):
-        if not dirname:
-            print('目录名为空')
+    def share(self):
+        file_id_list = ""
+        share_name_list = []
+        add = "1"
+        while str(add) == "1":
+            share_num = input("分享文件的编号：")
+            num_test2 = share_num.isdigit()
+            if num_test2:
+                share_num = int(share_num)
+                if 0 < share_num < len(self.list) + 1:
+                    share_id = self.list[int(share_num) - 1]["FileId"]
+                    share_name = self.list[int(share_num) - 1]["FileName"]
+                    share_name_list.append(share_name)
+                    print(share_name_list)
+                    file_id_list = file_id_list + str(share_id) + ","
+                    add = input("输入1添加文件，0发起分享，其他取消")
+            else:
+                print("请输入数字，，")
+                add = "1"
+        if str(add) == "0":
+            share_pwd = input("提取码，不设留空：")
+            file_id_list = file_id_list.strip(",")
+            data = {
+                "driveId": 0,
+                "expiration": "2024-02-09T11:42:45+08:00",
+                "fileIdList": file_id_list,
+                "shareName": "我的分享",
+                "sharePwd": share_pwd,
+            }
+            share_res = requests.post(
+                "https://www.123pan.com/a/api/share/create",
+                headers=self.header_logined,
+                data=json.dumps(data),
+                timeout=10
+            )
+            share_res_json = share_res.json()
+            message = share_res_json["message"]
+            print(message)
+            share_key = share_res_json["data"]["ShareKey"]
+            share_url = "https://www.123pan.com/s/" + share_key
+            print("分享链接：\n" + share_url + "提取码：" + share_pwd)
+        else:
+            print("退出分享")
+
+    def up_load(self, file_path):
+        file_path = file_path.replace('"', "")
+        file_path = file_path.replace("\\", "/")
+        file_name = file_path.split("/")[-1]
+        print("文件名:", file_name)
+        if not os.path.exists(file_path):
+            print("文件不存在，请检查路径是否正确")
             return
-        # 支持路径形式 a/b/c
-        norm = self.normalize(dirname)
-        parent_path = '/' + '/'.join(norm.strip('/').split('/')[:-1]) if '/' in norm.strip('/') else '/'
-        dir_name = norm.strip('/').split('/')[-1]
-        parent_node = self.resolve(parent_path)
-        if not parent_node or parent_node['Type']!=1:
-            print('父目录不存在')
+        if os.path.isdir(file_path):
+            print("暂不支持文件夹上传")
             return
-        # 检测是否存在
-        for ch in self.api_list(parent_node['FileId']):
-            if ch['FileName'] == dir_name and ch['Type']==1:
-                print('目录已存在')
+        fsize = os.path.getsize(file_path)
+        with open(file_path, "rb") as f:
+            md5 = hashlib.md5()
+            while True:
+                data = f.read(64 * 1024)
+                if not data:
+                    break
+                md5.update(data)
+            readable_hash = md5.hexdigest()
+
+        list_up_request = {
+            "driveId": 0,
+            "etag": readable_hash,
+            "fileName": file_name,
+            "parentFileId": self.parent_file_id,
+            "size": fsize,
+            "type": 0,
+            "duplicate": 0,
+        }
+
+        sign = getSign("/b/api/file/upload_request")
+        up_res = requests.post(
+            "https://www.123pan.com/b/api/file/upload_request",
+            headers=self.header_logined,
+            params={sign[0]: sign[1]},
+            data=list_up_request,
+            timeout=10
+        )
+        up_res_json = up_res.json()
+        res_code_up = up_res_json["code"]
+        if res_code_up == 5060:
+            sure_upload = input("检测到1个同名文件,输入1覆盖，2保留两者，0取消：")
+            if sure_upload == "1":
+                list_up_request["duplicate"] = 1
+
+            elif sure_upload == "2":
+                list_up_request["duplicate"] = 2
+            else:
+                print("取消上传")
                 return
+            sign = getSign("/b/api/file/upload_request")
+            up_res = requests.post(
+                "https://www.123pan.com/b/api/file/upload_request",
+                headers=self.header_logined,
+                params={sign[0]: sign[1]},
+                data=json.dumps(list_up_request),
+                timeout=10
+            )
+            up_res_json = up_res.json()
+        res_code_up = up_res_json["code"]
+        if res_code_up == 0:
+            # print(upResJson)
+            # print("上传请求成功")
+            reuse = up_res_json["data"]["Reuse"]
+            if reuse:
+                print("上传成功，文件已MD5复用")
+                return
+        else:
+            print(up_res_json)
+            print("上传请求失败")
+            return
+
+        bucket = up_res_json["data"]["Bucket"]
+        storage_node = up_res_json["data"]["StorageNode"]
+        upload_key = up_res_json["data"]["Key"]
+        upload_id = up_res_json["data"]["UploadId"]
+        up_file_id = up_res_json["data"]["FileId"]  # 上传文件的fileId,完成上传后需要用到
+        print("上传文件的fileId:", up_file_id)
+
+        # 获取已将上传的分块
+        start_data = {
+            "bucket": bucket,
+            "key": upload_key,
+            "uploadId": upload_id,
+            "storageNode": storage_node,
+        }
+        start_res = requests.post(
+            "https://www.123pan.com/b/api/file/s3_list_upload_parts",
+            headers=self.header_logined,
+            data=json.dumps(start_data),
+            timeout=10
+        )
+        start_res_json = start_res.json()
+        res_code_up = start_res_json["code"]
+        if res_code_up == 0:
+            # print(startResJson)
+            pass
+        else:
+            print(start_data)
+            print(start_res_json)
+
+            print("获取传输列表失败")
+            return
+
+        # 分块，每一块取一次链接，依次上传
+        block_size = 5242880
+        with open(file_path, "rb") as f:
+            part_number_start = 1
+            put_size = 0
+            while True:
+                data = f.read(block_size)
+
+                precent = round(put_size / fsize, 2)
+                print("\r已上传：" + str(precent * 100) + "%", end="")
+                put_size = put_size + len(data)
+
+                if not data:
+                    break
+                get_link_data = {
+                    "bucket": bucket,
+                    "key": upload_key,
+                    "partNumberEnd": part_number_start + 1,
+                    "partNumberStart": part_number_start,
+                    "uploadId": upload_id,
+                    "StorageNode": storage_node,
+                }
+
+                get_link_url = (
+                    "https://www.123pan.com/b/api/file/s3_repare_upload_parts_batch"
+                )
+                get_link_res = requests.post(
+                    get_link_url,
+                    headers=self.header_logined,
+                    data=json.dumps(get_link_data),
+                    timeout=10
+                )
+                get_link_res_json = get_link_res.json()
+                res_code_up = get_link_res_json["code"]
+                if res_code_up == 0:
+                    # print("获取链接成功")
+                    pass
+                else:
+                    print("获取链接失败")
+                    # print(getLinkResJson)
+                    return
+                # print(getLinkResJson)
+                upload_url = get_link_res_json["data"]["presignedUrls"][
+                    str(part_number_start)
+                ]
+                # print("上传链接",uploadUrl)
+                requests.put(upload_url, data=data, timeout=10)
+                # print("put")
+
+                part_number_start = part_number_start + 1
+
+        print("\n处理中")
+        # 完成标志
+        # 1.获取已上传的块
+        uploaded_list_url = "https://www.123pan.com/b/api/file/s3_list_upload_parts"
+        uploaded_comp_data = {
+            "bucket": bucket,
+            "key": upload_key,
+            "uploadId": upload_id,
+            "storageNode": storage_node,
+        }
+        # print(uploadedCompData)
+        requests.post(
+            uploaded_list_url,
+            headers=self.header_logined,
+            data=json.dumps(uploaded_comp_data),
+            timeout=10
+        )
+        compmultipart_up_url = (
+            "https://www.123pan.com/b/api/file/s3_complete_multipart_upload"
+        )
+        requests.post(
+            compmultipart_up_url,
+            headers=self.header_logined,
+            data=json.dumps(uploaded_comp_data),
+            timeout=10
+        )
+
+        # 3.报告完成上传，关闭upload session
+        if fsize > 64 * 1024 * 1024:
+            time.sleep(3)
+        close_up_session_url = "https://www.123pan.com/b/api/file/upload_complete"
+        close_up_session_data = {"fileId": up_file_id}
+        # print(closeUpSessionData)
+        close_up_session_res = requests.post(
+            close_up_session_url,
+            headers=self.header_logined,
+            data=json.dumps(close_up_session_data),
+            timeout=10
+        )
+        close_res_json = close_up_session_res.json()
+        # print(closeResJson)
+        res_code_up = close_res_json["code"]
+        if res_code_up == 0:
+            print("上传成功")
+        else:
+            print("上传失败")
+            print(close_res_json)
+            return
+
+    # dirId 就是 fileNumber，从0开始，0为第一个文件，传入时需要减一 ！！！（好像文件夹都排在前面）
+    def cd(self, dir_num):
+        if not dir_num.isdigit():
+            if dir_num == "..":
+                if len(self.parent_file_list) > 1:
+                    self.parent_file_list.pop()
+                    self.parent_file_id = self.parent_file_list[-1]
+                    self.get_dir()
+                    self.show()
+                else:
+                    print("已经是根目录")
+                return
+            if dir_num == "/":
+                self.parent_file_id = 0
+                self.parent_file_list = [0]
+                self.get_dir()
+                self.show()
+                return
+            print("输入错误")
+            return
+        dir_num = int(dir_num) - 1
+        if dir_num >= (len(self.list) - 1) or dir_num < 0:
+            print("输入错误")
+            return
+        if self.list[dir_num]["Type"] != 1:
+            print("不是文件夹")
+            return
+        self.parent_file_id = self.list[dir_num]["FileId"]
+        self.parent_file_list.append(self.parent_file_id)
+        self.get_dir()
+        self.show()
+
+    def cdById(self, file_id):
+        self.parent_file_id = file_id
+        self.parent_file_list.append(self.parent_file_id)
+        self.get_dir()
+        self.get_dir()
+        self.show()
+
+    def read_ini(
+            self,
+            user_name,
+            pass_word,
+            input_pwd,
+            authorization="",
+    ):
+        try:
+            with open("123pan.txt", "r",encoding="utf-8") as f:
+                text = f.read()
+            text = json.loads(text)
+            user_name = text["userName"]
+            pass_word = text["passWord"]
+            authorization = text["authorization"]
+
+        except:
+            print("获取配置失败，重新登录")
+
+            if user_name == "" or pass_word == "":
+                if input_pwd:
+                    user_name = input("userName:")
+                    pass_word = input("passWord:")
+                    authorization = ""
+                else:
+                    raise Exception("禁止输入模式下，没有账号或密码")
+
+        self.user_name = user_name
+        self.password = pass_word
+        self.authorization = authorization
+
+    def mkdir(self, dirname, remakedir=False):
+        if not remakedir:
+            for i in self.list:
+                if i["FileName"] == dirname:
+                    print("文件夹已存在")
+                    return i["FileId"]
+
+        url = "https://www.123pan.com/a/api/file/upload_request"
         data_mk = {
             "driveId": 0,
             "etag": "",
-            "fileName": dir_name,
-            "parentFileId": parent_node['FileId'],
+            "fileName": dirname,
+            "parentFileId": self.parent_file_id,
             "size": 0,
             "type": 1,
             "duplicate": 1,
@@ -474,296 +837,147 @@ class Pan123:
         }
         sign = getSign("/a/api/file/upload_request")
         res_mk = requests.post(
-            "https://www.123pan.com/a/api/file/upload_request",
+            url,
             headers=self.header_logined,
             data=json.dumps(data_mk),
             params={sign[0]: sign[1]},
             timeout=10
         )
         try:
-            js = res_mk.json()
-        except:
-            print('创建失败:', res_mk.text)
+            res_json = res_mk.json()
+            print(res_json)
+        except json.decoder.JSONDecodeError:
+            print("创建失败")
+            print(res_mk.text)
             return
-        if js.get('code')==0:
-            print('创建成功')
-            self.dir_cache.pop(parent_node['FileId'], None)
-        else:
-            print('创建失败:', js)
+        code_mkdir = res_json["code"]
 
-    def read_ini(self, user_name, pass_word, input_pwd, authorization=""):
-        try:
-            with open("123pan.txt", "r", encoding="utf-8") as f:
-                txt = json.loads(f.read())
-            self.user_name = txt["userName"]
-            self.password = txt["passWord"]
-            self.authorization = txt["authorization"]
-            if self.authorization:
-                self.header_logined["Authorization"] = self.authorization
-            else:
-                print("配置中无有效 token，准备登录…")
-                self.login()
-        except Exception:
-            print('配置读取失败')
-            if (not user_name or not pass_word) and input_pwd:
-                self.user_name = input('userName:')
-                self.password = input('passWord:')
-                self.authorization = ''
-                self.login()
-            else:
-                self.user_name = user_name
-                self.password = pass_word
-                self.authorization = authorization
-                if not self.authorization:
-                    self.login()
+        if code_mkdir == 0:
+            print("创建成功: ", res_json["data"]["FileId"])
+            self.get_dir()
+            return res_json["data"]["Info"]["FileId"]
+        print("创建失败")
+        print(res_json)
+        return
 
-    # ------------------ 补全 ------------------
-    def _setup_completion(self):
-        def completer(text, state):
-            line = readline.get_line_buffer()
-            parts = line.split()
-            stripped = line.strip()
-            # 基础命令补全（首参数）
-            if ' ' not in stripped and not line.endswith(' '):
-                cands = [c for c in self.base_commands if c.startswith(text)]
-                try: return cands[state]
-                except IndexError: return None
-            if not parts:
-                return None
-            cmd = parts[0]
-            # -------- download 命令逻辑 --------
-            if cmd == 'download':
-                arg_text = line[len('download'):].lstrip()
-                tokens = arg_text.split()
-                # 当前光标所在 token
-                current_token = '' if line.endswith(' ') else tokens[-1]
-                # 判定是否进入本地路径补全：至少已有一个远程参数(可解析或含通配符)，且当前 token 不可解析为远程并且本地存在(或以 ~ 开头)
-                has_remote = any(('*' in t or '?' in t or self.resolve(t) is not None) for t in tokens[:-1]) if len(tokens) > 1 else False
-                is_local_candidate = (
-                    has_remote and current_token and '*' not in current_token and '?' not in current_token and
-                    self.resolve(current_token) is None and (
-                        current_token.startswith('~') or os.path.exists(os.path.expanduser(current_token.rstrip('/')))
-                    )
-                )
-                if is_local_candidate:
-                    return self._local_path_completer(current_token, state)
-                # 远程路径补全
-                return self._remote_path_completer(current_token, state)
-            # -------- 其它远程路径命令 --------
-            if cmd in ('cd','ls','delete','link','mkdir'):
-                arg_part = line[len(cmd):].lstrip()
-                current_token = '' if line.endswith(' ') else arg_part.split()[-1]
-                return self._remote_path_completer(current_token, state)
-            # -------- setdir 本地路径补全 --------
-            if cmd == 'setdir':
-                arg_part = line[len(cmd):].lstrip()
-                current_token = '' if line.endswith(' ') else arg_part.split()[-1]
-                return self._local_path_completer(current_token, state)
-            return None
-        readline.set_completer(completer)
-        readline.parse_and_bind('tab: complete')
 
-    def _remote_path_completer(self, text, state):
-        """远程路径补全（修正：目录后加 / 仅列该目录子项，前缀匹配不再回退根）"""
-        # 空输入或仅 '/' -> 根目录子项
-        if text in (None, '', '/'):  
-            root_children = self.api_list(0)
-            cands = []
-            for ch in root_children:
-                suff = '/' if ch['Type']==1 else ''
-                cands.append(ch['FileName'] + suff)
-            try: return cands[state]
-            except IndexError: return None
-        is_abs = text.startswith('/')
-        norm = self.normalize(text)
-        # 目录完整（以 / 结尾）：列出该目录子项
-        if text.endswith('/'):
-            base_dir = self.normalize(text.rstrip('/'))
-            node = self.resolve(base_dir)
-            if not node or node.get('Type')!=1:
-                return None
-            children = self.api_list(node['FileId'])
-            cands = []
-            for ch in children:
-                suff = '/' if ch['Type']==1 else ''
-                # 保持输入风格：相对输入返回相对路径，绝对输入返回绝对路径
-                if is_abs:
-                    show = base_dir.rstrip('/') + '/' + ch['FileName'] + suff if base_dir != '/' else '/' + ch['FileName'] + suff
-                else:
-                    # 去掉当前工作路径前缀
-                    if base_dir == '/':
-                        show = ch['FileName'] + suff
-                    else:
-                        rel_base = base_dir.lstrip('/')
-                        show = rel_base + '/' + ch['FileName'] + suff
-                cands.append(show)
-            try: return cands[state]
-            except IndexError: return None
-        # 非结尾：做前缀匹配
-        # 拆分父目录与前缀
-        # 使用原始输入判断相对/绝对
-        if '/' in text.rstrip('/'):
-            parent_part = text.rstrip('/').rsplit('/',1)[0]
-            prefix = text.rstrip('/').rsplit('/',1)[1]
-        else:
-            parent_part = ''
-            prefix = text.rstrip('/')
-        parent_path = self.normalize(parent_part) if parent_part else self.pwd()
-        parent_node = self.resolve(parent_path)
-        if not parent_node or parent_node.get('Type')!=1:
-            return None
-        children = self.api_list(parent_node['FileId'])
-        cands = []
-        for ch in children:
-            if not prefix or ch['FileName'].startswith(prefix):
-                suff = '/' if ch['Type']==1 else ''
-                if is_abs or parent_part.startswith('/'):
-                    # 绝对输入
-                    if parent_path=='/':
-                        show = '/' + ch['FileName'] + suff
-                    else:
-                        show = parent_path.rstrip('/') + '/' + ch['FileName'] + suff
-                else:
-                    # 相对输入
-                    if parent_path=='/':
-                        show = ch['FileName'] + suff
-                    else:
-                        show = parent_path.lstrip('/') + '/' + ch['FileName'] + suff
-                cands.append(show)
-        try: return cands[state]
-        except IndexError: return None
-
-    def _local_path_completer(self, text, state):
-        """本地路径补全逻辑(改进: 合并重复斜杠, 支持 ~ 展开)"""
-        import re as _re
-        if text.startswith('~'):
-            base = os.path.expanduser(text)
-        else:
-            base = text
-        # 合并多余斜杠
-        base = _re.sub(r'/+', '/', base)
-        # 若是目录前缀(以 / 结尾)直接列其内容
-        if os.path.isdir(base.rstrip('/')):
-            dirname = base.rstrip('/')
-        else:
-            dirname = os.path.dirname(base) if os.path.dirname(base) else '.'
-        prefix = os.path.basename(base) if not base.endswith('/') else ''
-        try:
-            entries = os.listdir(dirname or '.')
-        except Exception:
-            return None
-        cands = []
-        for e in entries:
-            if not prefix or e.startswith(prefix):
-                full = os.path.join(dirname, e)
-                show = full
-                if full.startswith('./'):
-                    show = full[2:]
-                if os.path.isdir(full):
-                    show += '/'
-                cands.append(show)
-        try:
-            return cands[state]
-        except IndexError:
-            return None
-
-    def help(self):
-        print('\n命令 (路径模式)')
-        print(' pwd                       显示当前路径')
-        print(' ls [path]                 列出目录内容')
-        print(' cd <path>                 切换目录 (支持 .. / 绝对/相对)')
-        print(' download <path...> [local_dir]  下载文件/目录(目录递归展开) 可加本地目标目录')
-        print(' link <path>               显示下载直链')
-        print(' delete <path>             删除文件或目录(目录进入回收站)')
-        print(' mkdir <path>              创建目录(可递归如 a/b/c)')
-        print(' setdir <local_path>       设置默认本地下载保存目录')
-        print(' upload                    上传文件 (交互输入本地路径)')
-        print(' share                     交互式分享(暂未重构)')
-        print(' log                       重新登录刷新 token')
-        print(' re                        刷新当前目录缓存')
-        print(' reload                    重新读取配置文件')
-        print(' help                      帮助')
-        print(' exit                      退出')
-
-# ================================= 主循环 =================================
-if __name__ == '__main__':
+if __name__ == "__main__":
     pan = Pan123(readfile=True, input_pwd=True)
-    print('当前目录:', pan.pwd())
-    if readline and not hasattr(readline, 'get_line_buffer'):
-        try: pan._setup_completion()
-        except: pass
+    pan.show()
     while True:
-        try:
-            cmd_line = input('\033[92m123pan:\033[0m' + pan.pwd() + '$ ').strip()
-        except (EOFError, KeyboardInterrupt):
-            print('\n退出')
-            break
-        if not cmd_line: continue
-        parts = cmd_line.split()
-        cmd = parts[0]
-        args = parts[1:]
-        if cmd == 'exit': break
-        elif cmd == 'help': pan.help()
-        elif cmd == 'pwd': print(pan.pwd())
-        elif cmd == 'ls': pan.ls(args[0] if args else '')
-        elif cmd == 'cd':
-            if not args: print('缺少路径'); continue
-            pan.cd(args[0])
-        elif cmd == 're':
-            pan.re()
-        elif cmd == 'setdir':
-            if not args: print('缺少本地路径'); continue
-            pan.set_download_dir(args[0])
-        elif cmd == 'link':
-            if not args: print('缺少路径'); continue
-            pan.link_path(args[0])
-        elif cmd == 'download':
-            if not args: print('缺少路径'); continue
-            remote_patterns = args
-            local_dir = None
-            if len(args) > 1:
-                last_arg = args[-1]
-                # 新判定：必须已存在至少一个远程参数，并且最后一个参数不可解析为远程且本地路径存在或以 ~ 开头
-                has_remote = any(('*' in a or '?' in a or pan.resolve(a) is not None) for a in args[:-1])
-                if has_remote and '*' not in last_arg and '?' not in last_arg and pan.resolve(last_arg) is None and (last_arg.startswith('~') or os.path.exists(os.path.expanduser(last_arg.rstrip('/')))):
-                    local_dir = os.path.expanduser(last_arg)
-                    remote_patterns = args[:-1]
-                    print(f"检测到本地下载路径: {local_dir}")
-            expanded = []
-            for p in remote_patterns:
-                if '*' in p or '?' in p:
-                    norm = pan.normalize(p)
-                    base_dir = '/' + '/'.join(norm.strip('/').split('/')[:-1]) if '/' in norm.strip('/') else pan.pwd()
-                    pattern = norm.strip('/').split('/')[-1]
-                    base_node = pan.resolve(base_dir)
-                    if not base_node or base_node['Type']!=1:
-                        print('通配父目录不存在:', base_dir); continue
-                    for ch in pan.api_list(base_node['FileId']):
-                        if fnmatch(ch['FileName'], pattern):
-                            child_path = (base_dir.rstrip('/')+'/' if base_dir!='/' else '/') + ch['FileName']
-                            expanded.append(child_path)
+        command = input("\033[91m >\033[0m").strip()
+        if not command:
+            continue
+        if command == 'help':
+            pan.help(); continue
+        if command == "ls":
+            pan.show(); continue
+        if command == "re":
+            code = pan.get_dir();
+            if code == 0: print("刷新目录成功"); pan.show(); continue
+        if command.startswith('download '):
+            exprs = command[9:].strip()
+            if not exprs:
+                print('请输入编号表达式'); continue
+            pan.download_batch(exprs.split())
+            continue
+        if command.startswith('upload'):
+            parts = command.split()
+            if len(parts) == 1:
+                filepath = input("请输入文件路径：")
+                pan.up_load(filepath); pan.get_dir(); pan.show(); continue
+            else:
+                pan.up_load_batch(parts[1:]); pan.get_dir(); pan.show(); continue
+        if command.isdigit():
+            if int(command) > len(pan.list) or int(command) < 1:
+                print("输入错误")
+                continue
+            if pan.list[int(command) - 1]["Type"] == 1:
+                pan.cdById(pan.list[int(command) - 1]["FileId"])
+            else:
+                size = pan.list[int(command) - 1]["Size"]
+                if size > 1048576:
+                    size_print_show = str(round(size / 1048576, 2)) + "M"
                 else:
-                    expanded.append(p)
-            final_files = []
-            for ep in expanded:
-                final_files.extend(pan.collect_files(ep))
-            if not final_files:
-                print('没有可下载文件'); continue
-            print('总文件数(含目录展开):', len(final_files))
-            pan.download_many_paths(final_files, local_dir)
-        elif cmd == 'delete':
-            if not args: print('缺少路径'); continue
-            pan.delete_path(args[0])
-        elif cmd == 'mkdir':
-            if not args: print('缺少路径'); continue
-            pan.mkdir(args[0])
-        elif cmd == 'upload':
-            local_path = input('本地文件路径: ').strip()
-            pan.up_load(local_path)
-        elif cmd == 'log': pan.login()
-        elif cmd == 'reload': pan.read_ini('', '', True); print('读取成功')
-        elif cmd == 'share':
-            print('分享交互仍使用旧编号逻辑，暂未重构')
+                    size_print_show = str(round(size / 1024, 2)) + "K"
+                # print(pan.list[int(command) - 1])
+                name = pan.list[int(command) - 1]["FileName"]
+                print(name + "  " + size_print_show)
+                print("press 1 to download now: ", end="")
+                sure = input()
+                if sure == "1":
+                    pan.download(int(command) - 1)
+        elif command[0:9] == "download ":
+            if command[9:].isdigit():
+                if int(command[9:]) > len(pan.list) or int(command[9:]) < 1:
+                    print("输入错误")
+                    continue
+                pan.download(int(command[9:]) - 1)
+            else:
+                print("输入错误")
+        elif command == "exit":
+            break
+        elif command == "log":
+            pan.login()
+            pan.get_dir()
+            pan.show()
+
+        elif command[0:5] == "link ":
+            if command[5:].isdigit():
+                if int(command[5:]) > len(pan.list) or int(command[5:]) < 1:
+                    print("输入错误")
+                    continue
+                pan.link(int(command[5:]) - 1)
+            else:
+                print("输入错误")
+        elif command == "upload":
+            filepath = input("请输入文件路径：")
+            pan.up_load(filepath)
+            pan.get_dir()
+            pan.show()
+        elif command == "share":
             pan.share()
-        else:
-            print('未知命令，输入 help 获取帮助')
+        elif command[0:6] == "delete":
+            if command == "delete":
+                print("请输入要删除的文件编号：", end="")
+                fileNumber = input()
+            else:
+                if command[6] == " ":
+                    fileNumber = command[7:]
+                else:
+                    print("输入错误")
+                    continue
+                if fileNumber == "":
+                    print("请输入要删除的文件编号：", end="")
+                    fileNumber = input()
+                else:
+                    fileNumber = fileNumber[0:]
+            if fileNumber.isdigit():
+                if int(fileNumber) > len(pan.list) or int(fileNumber) < 1:
+                    print("输入错误")
+                    continue
+                pan.delete_file(int(fileNumber) - 1)
+                pan.get_dir()
+                pan.show()
+            else:
+                print("输入错误")
+
+        elif command[:3] == "cd ":
+            path = command[3:]
+            pan.cd(path)
+        elif command[0:5] == "mkdir":
+            if command == "mkdir":
+                newPath = input("请输入目录名:")
+            else:
+                newPath = command[6:]
+                if newPath == "":
+                    newPath = input("请输入目录名:")
+                else:
+                    newPath = newPath[0:]
+            print(pan.mkdir(newPath))
+
+        elif command == "reload":
+            pan.read_ini("", "", True)
+            print("读取成功")
+            pan.get_dir()
+            pan.show()
