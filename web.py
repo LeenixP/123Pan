@@ -131,8 +131,22 @@ class Pan123:
         print('批量下载完成')
 
     def up_load_batch(self, paths):
-        """批量上传(顺序执行), 支持通配符"""
+        """批量上传(顺序执行), 支持通配符; 最后一个参数若不是本地路径且不含 *? 视为远程目标目录"""
         import glob
+        if not paths:
+            print('参数为空'); return
+        remote_target = None
+        last = paths[-1]
+        if ('*' not in last and '?' not in last and not os.path.exists(last)):
+            remote_target = last
+            paths = paths[:-1]
+        original_id = self.parent_file_id
+        original_stack = list(self.parent_file_list)
+        if remote_target:
+            print(f'远程目标目录: {remote_target}')
+            rid = self.ensure_remote_dir(remote_target)
+            if not rid:
+                print('远程目录处理失败'); return
         files = []
         for p in paths:
             expanded = glob.glob(p)
@@ -144,13 +158,22 @@ class Pan123:
                 else:
                     files.append(fp)
         if not files:
-            print('没有可上传文件')
+            print('没有可上传文件');
+            # 恢复目录
+            if remote_target:
+                self.parent_file_id = original_id
+                self.parent_file_list = original_stack
             return
         print('准备上传文件数:', len(files))
         for fp in files:
             print('上传:', fp)
             self.up_load(fp)
         print('批量上传完成')
+        # 上传结束后恢复原目录
+        if remote_target:
+            self.parent_file_id = original_id
+            self.parent_file_list = original_stack
+            self.get_dir()
 
     # ------------------ 命令补全 ------------------
     def _setup_completion(self):
@@ -541,9 +564,36 @@ class Pan123:
         else:
             print("退出分享")
 
+    def ensure_remote_dir(self, remote_path: str):
+        """确保(相对当前)远程目录存在, 支持 a/b/c。返回最终目录 FileId。保持在该目录。"""
+        parts = [p for p in remote_path.strip('/').split('/') if p]
+        for name in parts:
+            # 查找是否已存在目录
+            target = None
+            for item in self.list or []:
+                if item.get('Type') == 1 and item.get('FileName') == name:
+                    target = item
+                    break
+            if not target:
+                # 创建目录
+                created_id = self.mkdir(name, remakedir=False)
+                self.get_dir()  # 刷新当前层
+                # 再次查找
+                for item in self.list or []:
+                    if item.get('Type') == 1 and item.get('FileName') == name:
+                        target = item
+                        break
+            if not target:
+                print(f'目录创建失败: {name}')
+                return None
+            # 进入该目录
+            self.parent_file_id = target['FileId']
+            self.parent_file_list.append(self.parent_file_id)
+            self.get_dir()
+        return self.parent_file_id
+
     def up_load(self, file_path):
-        file_path = file_path.replace('"', "")
-        file_path = file_path.replace("\\", "/")
+        file_path = file_path.replace('"', "").replace("\\", "/")
         file_name = file_path.split("/")[-1]
         print("文件名:", file_name)
         if not os.path.exists(file_path):
@@ -553,7 +603,8 @@ class Pan123:
             print("暂不支持文件夹上传")
             return
         fsize = os.path.getsize(file_path)
-        # 根据文件大小自适应 MD5 计算块大小（不影响上传分块，仅影响本地读取性能）
+        human = (lambda s: f"{s/1024/1024:.2f}MB" if s>1024*1024 else f"{s/1024:.2f}KB")(fsize)
+        print("总大小:", human)
         md5_chunk = 1024 * 1024 if fsize > 2 * 1024 * 1024 else 64 * 1024
         with open(file_path, "rb") as f:
             md5 = hashlib.md5()
@@ -563,7 +614,6 @@ class Pan123:
                     break
                 md5.update(data)
             readable_hash = md5.hexdigest()
-
         list_up_request = {
             "driveId": 0,
             "etag": readable_hash,
@@ -573,19 +623,18 @@ class Pan123:
             "type": 0,
             "duplicate": 0,
         }
-
         sign = getSign("/b/api/file/upload_request")
         up_res = requests.post(
             "https://www.123pan.com/b/api/file/upload_request",
             headers=self.header_logined,
             params={sign[0]: sign[1]},
             data=list_up_request,
-            timeout=20
+            timeout=30
         )
         up_res_json = up_res.json()
         res_code_up = up_res_json["code"]
         if res_code_up == 5060:
-            sure_upload = input("检测到1个同名文件,输入1覆盖，2保留两者，0取消：")
+            sure_upload = input("检测到同名文件,输入1覆盖，2保留两者，0取消：")
             if sure_upload == "1":
                 list_up_request["duplicate"] = 1
             elif sure_upload == "2":
@@ -599,169 +648,151 @@ class Pan123:
                 headers=self.header_logined,
                 params={sign[0]: sign[1]},
                 data=json.dumps(list_up_request),
-                timeout=20
+                timeout=30
             )
             up_res_json = up_res.json()
         res_code_up = up_res_json["code"]
-        if res_code_up == 0:
-            reuse = up_res_json["data"]["Reuse"]
-            if reuse:
-                print("上传成功，文件已MD5复用")
-                return
-        else:
+        if res_code_up != 0:
             print(up_res_json)
             print("上传请求失败")
             return
-
+        reuse = up_res_json["data"].get("Reuse")
+        if reuse:
+            print("上传成功 (MD5复用)")
+            return
         bucket = up_res_json["data"]["Bucket"]
         storage_node = up_res_json["data"]["StorageNode"]
         upload_key = up_res_json["data"]["Key"]
         upload_id = up_res_json["data"]["UploadId"]
         up_file_id = up_res_json["data"]["FileId"]
         print("上传文件的fileId:", up_file_id)
-
-        # 获取已上传块（用于断点续传）
-        start_data = {
-            "bucket": bucket,
-            "key": upload_key,
-            "uploadId": upload_id,
-            "storageNode": storage_node,
-        }
+        start_data = {"bucket": bucket, "key": upload_key, "uploadId": upload_id, "storageNode": storage_node}
         start_res = requests.post(
             "https://www.123pan.com/b/api/file/s3_list_upload_parts",
             headers=self.header_logined,
             data=json.dumps(start_data),
-            timeout=20
+            timeout=30
         )
-        start_res_json = start_res.json()
-        res_code_up = start_res_json["code"]
         uploaded_parts = set()
-        if res_code_up == 0 and "data" in start_res_json and isinstance(start_res_json["data"], dict):
-            for part in start_res_json["data"].get("Parts", []):
-                # 兼容不同字段名
-                pn = part.get("PartNumber") or part.get("partNumber")
-                if pn:
-                    uploaded_parts.add(int(pn))
+        try:
+            start_res_json = start_res.json()
+            if start_res_json.get("code") == 0:
+                for part in start_res_json.get("data", {}).get("Parts", []):
+                    pn = part.get("PartNumber") or part.get("partNumber")
+                    if pn: uploaded_parts.add(int(pn))
+        except Exception:
+            pass
+        # 固定大文件分块为 5MB (S3 兼容) 仅最后一块可小；避免自定义大小导致服务端校验失败
+        min_part = 5 * 1024 * 1024
+        if fsize <= min_part:
+            block_size = fsize
         else:
-            print("获取传输列表失败或无已上传分块，继续")
-
-        # 自适应分块大小：小文件单块，大文件增大分块减少请求次数（最大保持 5MB）
-        if fsize <= 5 * 1024 * 1024:
-            block_size = fsize  # 单块
-        elif fsize <= 50 * 1024 * 1024:
-            block_size = 2 * 1024 * 1024
-        else:
-            block_size = 5 * 1024 * 1024  # 与原逻辑兼容
-
-        # PUT 超时时间基于分块大小估算：最小 15 秒，较大分块增大
-        put_timeout = max(15, int(block_size / (256 * 1024)) * 5)
-        max_retries = 5
-
-        def put_with_retry(url, data_block, part_no):
+            # 若环境变量 PAN_PART_SIZE 合法(>=5MB <=32MB)则采用
+            env_part = os.environ.get('PAN_PART_SIZE')
+            if env_part and env_part.isdigit():
+                v = int(env_part)
+                if 5*1024*1024 <= v <= 32*1024*1024:
+                    block_size = v
+                else:
+                    block_size = min_part
+            else:
+                block_size = min_part  # 统一 5MB
+        print(f"实际分块大小: {block_size/1024/1024:.2f}MB")
+        # PUT 初始超时: 基于块大小估算，最少 60 秒
+        put_timeout_base = max(60, int(block_size / (512*1024)) * 10)
+        max_retries = 6
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=0)
+        session.mount('http://', adapter); session.mount('https://', adapter)
+        def get_part_url(part_no):
+            get_link_data = {
+                "bucket": bucket,
+                "key": upload_key,
+                "partNumberEnd": part_no + 1,
+                "partNumberStart": part_no,
+                "uploadId": upload_id,
+                "StorageNode": storage_node,
+            }
             for attempt in range(1, max_retries + 1):
                 try:
-                    r = requests.put(url, data=data_block, timeout=put_timeout)
-                    if r.status_code in (200, 204):
+                    resp = session.post(
+                        "https://www.123pan.com/b/api/file/s3_repare_upload_parts_batch",
+                        headers=self.header_logined,
+                        data=json.dumps(get_link_data),
+                        timeout=30
+                    )
+                    js = resp.json()
+                    if js.get("code") == 0:
+                        return js["data"]["presignedUrls"].get(str(part_no))
+                    print(f"获取链接失败 code={js.get('code')} 重试 {attempt}/{max_retries}")
+                except Exception as e:
+                    print(f"获取链接异常: {e} 重试 {attempt}/{max_retries}")
+                time.sleep(2*attempt)
+            return None
+        def upload_part(url, data_block, part_no):
+            for attempt in range(1, max_retries + 1):
+                timeout_cur = put_timeout_base * attempt  # 逐次扩展超时
+                try:
+                    r = session.put(url, data=data_block, timeout=timeout_cur)
+                    if r.status_code in (200,204):
                         return True
-                    print(f"Part {part_no} 返回状态 {r.status_code}，重试 {attempt}/{max_retries}")
-                except requests.RequestException as e:
-                    print(f"Part {part_no} 发送异常: {e}，重试 {attempt}/{max_retries}")
-                time.sleep(2 * attempt)
+                    print(f"Part {part_no} 状态 {r.status_code} 重试 {attempt}/{max_retries}")
+                except Exception as e:
+                    print(f"Part {part_no} 异常 {e} 重试 {attempt}/{max_retries}")
+                # 如果失败，重新获取最新 URL
+                url = get_part_url(part_no)
+                if not url:
+                    print(f"Part {part_no} 无法重新获取URL, 终止")
+                    return False
             return False
-
-        # 分块上传
         with open(file_path, "rb") as f:
-            part_number_start = 1
-            put_size = 0
-            total_parts = (fsize + block_size - 1) // block_size
+            part_no = 1
+            sent = 0
+            total_parts_est = (fsize + block_size -1)//block_size
+            start_time = time.time()
             while True:
-                if part_number_start in uploaded_parts:
-                    # 跳过已上传分块 -> 读取并丢弃对应数据
+                if part_no in uploaded_parts:
                     f.seek(block_size, 1)
-                    put_size += block_size
-                    part_number_start += 1
+                    sent += block_size
+                    part_no += 1
                     continue
-                data = f.read(block_size)
-                if not data:
+                data_block = f.read(block_size)
+                if not data_block:
                     break
-                percent = round(put_size / fsize * 100, 2)
-                print(f"\r已上传：{percent}% ({part_number_start}/{total_parts})", end="")
-                get_link_data = {
-                    "bucket": bucket,
-                    "key": upload_key,
-                    "partNumberEnd": part_number_start + 1,
-                    "partNumberStart": part_number_start,
-                    "uploadId": upload_id,
-                    "StorageNode": storage_node,
-                }
-                get_link_url = "https://www.123pan.com/b/api/file/s3_repare_upload_parts_batch"
-                # 重试获取分块上传链接
-                for attempt in range(1, max_retries + 1):
-                    try:
-                        get_link_res = requests.post(
-                            get_link_url,
-                            headers=self.header_logined,
-                            data=json.dumps(get_link_data),
-                            timeout=20
-                        )
-                        get_link_res_json = get_link_res.json()
-                        res_code_up = get_link_res_json["code"]
-                        if res_code_up == 0:
-                            break
-                        print(f"获取链接失败 code={res_code_up} 重试 {attempt}/{max_retries}")
-                    except requests.RequestException as e:
-                        print(f"获取链接异常: {e} 重试 {attempt}/{max_retries}")
-                    time.sleep(2 * attempt)
-                else:
-                    print("获取上传链接多次失败，终止")
+                url = get_part_url(part_no)
+                if not url:
+                    print("获取分块上传链接失败，终止")
                     return
-                upload_url = get_link_res_json["data"]["presignedUrls"][str(part_number_start)]
-                if not put_with_retry(upload_url, data, part_number_start):
-                    print("分块上传失败，终止")
+                ok = upload_part(url, data_block, part_no)
+                if not ok:
+                    print("分块上传终止")
                     return
-                put_size += len(data)
-                part_number_start += 1
-
+                sent += len(data_block)
+                percent = sent / fsize * 100
+                elapsed = time.time() - start_time
+                speed = sent / (elapsed+1e-6)  # B/s
+                speed_str = f"{speed/1024/1024:.2f}MB/s" if speed>1024*1024 else f"{speed/1024:.2f}KB/s"
+                print(f"\r已上传 {percent:.2f}% ({part_no}/{total_parts_est}) 速度 {speed_str}", end="")
+                part_no += 1
         print("\n处理中")
-        # 完成标志
-        uploaded_list_url = "https://www.123pan.com/b/api/file/s3_list_upload_parts"
-        uploaded_comp_data = {
-            "bucket": bucket,
-            "key": upload_key,
-            "uploadId": upload_id,
-            "storageNode": storage_node,
-        }
-        requests.post(
-            uploaded_list_url,
-            headers=self.header_logined,
-            data=json.dumps(uploaded_comp_data),
-            timeout=20
-        )
-        compmultipart_up_url = "https://www.123pan.com/b/api/file/s3_complete_multipart_upload"
-        requests.post(
-            compmultipart_up_url,
-            headers=self.header_logined,
-            data=json.dumps(uploaded_comp_data),
-            timeout=20
-        )
-        if fsize > 64 * 1024 * 1024:
-            time.sleep(3)
-        close_up_session_url = "https://www.123pan.com/b/api/file/upload_complete"
-        close_up_session_data = {"fileId": up_file_id}
+        uploaded_comp_data = {"bucket": bucket,"key": upload_key,"uploadId": upload_id,"storageNode": storage_node}
+        requests.post("https://www.123pan.com/b/api/file/s3_list_upload_parts", headers=self.header_logined, data=json.dumps(uploaded_comp_data), timeout=60)
+        requests.post("https://www.123pan.com/b/api/file/s3_complete_multipart_upload", headers=self.header_logined, data=json.dumps(uploaded_comp_data), timeout=60)
+        if fsize > 64*1024*1024: time.sleep(3)
         close_up_session_res = requests.post(
-            close_up_session_url,
+            "https://www.123pan.com/b/api/file/upload_complete",
             headers=self.header_logined,
-            data=json.dumps(close_up_session_data),
-            timeout=20
+            data=json.dumps({"fileId": up_file_id}),
+            timeout=60
         )
-        close_res_json = close_up_session_res.json()
-        res_code_up = close_res_json["code"]
-        if res_code_up == 0:
-            print("上传成功")
-        else:
-            print("上传失败")
-            print(close_res_json)
-            return
+        try:
+            close_res_json = close_up_session_res.json()
+            if close_res_json.get("code") == 0:
+                print("\n上传成功")
+            else:
+                print("\n上传完成阶段失败", close_res_json)
+        except Exception:
+            print("\n上传完成阶段解析失败", close_up_session_res.text)
 
     # dirId 就是 fileNumber，从0开始，0为第一个文件，传入时需要减一 ！！！（好像文件夹都排在前面）
     def cd(self, dir_num):
