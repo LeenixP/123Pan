@@ -14,8 +14,8 @@
 ## 环境准备
 1. 安装 Python 3.x。
 2. 安装依赖：
-```bash
-pip install requests
+```bash 
+pip3 install -i https://pypi.tuna.tsinghua.edu.cn/simple --no-cache-dir requests
 ```
 
 ## 启动
